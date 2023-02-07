@@ -229,3 +229,258 @@
        );
      };
      ```
+     
+     
+     
+2. 非等高虚拟滚动
+
+   在等高虚拟滚动里，由于每一个item元素的高度是一定的，因此我们可以很容易的计算渲染数组的起始位置`startIndex`和终止位置`endIndex`，但是对于每个元素高度不等，就不能直接通过`Math.floor(scrollTop / modelRef.value.itemHight)`去计算了。因此在非等高虚拟滚动中，难点就是如何获得起始和终止索引以及偏移量
+
+   
+
+   解决方法：**以预估高度先行渲染，然后获取真实高度并缓存**。
+
+   
+   
+   下面是html文件
+   
+   ```html
+   <template>
+     <div>
+       <!-- 外盒子 -->
+       <div class="outSideBox" @scroll="scrollFn">
+         <!-- 内盒子 -->
+         <div class="inSideBox" :style="`height: ${listHeight}px`">
+           <!-- 可视区 -->
+           <div :style="`transform:translateY(${modelRef.offsetY}px)`">
+             <div
+               v-for="(item, index) in curList"
+               :key="item.key"
+               class="list-item"
+               :data-index="item.key"
+               :style="`height:${item.height}px`"
+             >
+               {{ item.key }}
+             </div>
+           </div>
+         </div>
+       </div>
+     </div>
+   </template>
+   ```
+   
+   先定义一些基础变量
+   
+   ```js
+   const modelRef = ref({
+     //可视区域偏移高度
+     offsetY: 0,
+     //缓存区长度,比例,
+     cache: 1,
+     //起始索引
+     startIndex: 0,
+     //结束索引
+     endIndex: 0,
+     //预估高度
+     estimatedItemSize: 100,
+     //列表项渲染后存储每一项的高度以及位置信息
+     positions: [],
+     //渲染区域高度
+     screenHeight: 600
+   })
+   
+   //完整的数组
+   const totalList = ref([])
+   
+   //可视渲染条数：渲染区域高度/预估高度
+   const visibleCount = computed({
+     get: function () {
+       return Math.ceil(
+         modelRef.value.screenHeight / modelRef.value.estimatedItemSize
+       )
+     }
+   })
+   
+   //上缓存区
+   const aboveCount = computed({
+     get: function () {
+       return Math.min(
+         modelRef.value.startIndex,
+         modelRef.value.cache * visibleCount.value
+       )
+     }
+   })
+   
+   //下缓存区
+   const belowCount = computed({
+     get: function () {
+       return Math.min(
+         totalList.value.length - modelRef.value.endIndex,
+         modelRef.value.cache * visibleCount.value
+       )
+     }
+   })
+   
+   //当前渲染数据：可视区+上下缓存区
+   const curList = computed({
+     get: function () {
+       let start = modelRef.value.startIndex - aboveCount.value
+       let end = modelRef.value.endIndex + belowCount.value
+       return totalList.value.slice(start, end)
+     }
+   })
+   
+   //列表高度：positions数组中最后一个元素的底部位置
+   const listHeight = computed({
+     get: function () {
+       return modelRef.value.positions[modelRef.value.positions.length - 1]
+         ? modelRef.value.positions[modelRef.value.positions.length - 1].bottom
+         : 0;
+     },
+   });
+   ```
+   
+   首先模拟数据请求，拿到数据以后，对于每个元素，先给予一个预估高度`estimatedItemSize`，然后`positions`数组维护了整个列表的每一个元素的高度以及位置信息
+   
+   ```js
+   //模拟数据接口
+   const listDataApi = new Promise((resolved, rejected) => {
+     setTimeout(() => {
+       let arr = [];
+       for (let i = 0; i < 1000; i++) {
+         //随机高度
+         let temp = parseInt(Math.random() * 200);
+         temp = temp > 60 ? temp : 60;
+   
+         arr.push({
+           key: i,
+           height: temp,
+         });
+       }
+       resolved({
+         code: 200,
+         data: arr,
+       });
+     }, 1000);
+   });
+   
+   const getListData = async () => {
+     let res = await listDataApi;
+     if (res.code == 200) {
+       totalList.value = res.data;
+   
+       //根据预估高度初始化每个列表的高度信息
+       modelRef.value.positions = totalList.value.map((item, index) => {
+         return {
+           index,
+           top: index * modelRef.value.estimatedItemSize,
+           height: modelRef.value.estimatedItemSize,
+           bottom: (index + 1) * modelRef.value.estimatedItemSize,
+         };
+       });
+     }
+   };
+   
+   //发起请求
+   getListData();
+   ```
+   
+   这时候，`positions`数组每一项的高度都是一样的，但是实际上每一个元素的高度是不一定的，是由元素内容动态决定的，我们先假设就根据当前`positions`数组来计算起始和终止索引以及偏移量
+   
+   在scrollFn中实现：
+   
+   ```js
+   //滚动事件回调函数
+   const scrollFn = (e) => {
+     if (totalList.value.length == 0) return;
+   
+     let scrollTop = e.target.scrollTop;
+   
+     //更新可视区起始坐标：positions数组中第一个bottom值大于scrollTop元素的就是起始元素
+     modelRef.value.startIndex = modelRef.value.positions.findIndex((item) => {
+       return item.bottom > scrollTop;
+     });
+     //更新可视区终止坐标：起始坐标+可视个数
+     modelRef.value.endIndex = modelRef.value.startIndex + visibleCount.value;
+   };
+   ```
+   
+   偏移量offsetY，理想偏移量应该是起始索引对应的元素的top再减去上缓存区的高度，但由于positions数组中保存的数据不一定是实际Dom数据，也就是说`modelRef.value.positions[modelRef.value.startIndex - 1].bottom != modelRef.value.positions[modelRef.value.startIndex].top`，因此这里进行了优化：
+   
+   ```js
+   //获取偏移量
+     if (modelRef.value.startIndex >= 1) {
+       let size =
+         modelRef.value.positions[modelRef.value.startIndex].top -
+         (modelRef.value.positions[
+           modelRef.value.startIndex - aboveCount.value
+         ]
+           ? modelRef.value.positions[
+               modelRef.value.startIndex - aboveCount.value
+             ].top
+           : 0)
+       
+       //优化顺滑度
+       modelRef.value.offsetY =
+         modelRef.value.positions[modelRef.value.startIndex - 1].bottom - size
+     } else {
+       modelRef.value.offsetY = 0
+     }
+   ```
+   
+   现在实现的就是等高虚拟滚动
+   
+   但是实际上元素是非等高的，这样会导致startIndex和offsetY的计算问题，导致页面出现闪现效果。因此每次渲染数据更新，我们都要拿到渲染了的dom的实际高度和信息，去更新`positions`数组，这个方法可以在监听渲染数组中实现
+   
+   
+   
+   这里用了取巧的方式，直接生成模拟数据的时候，给每个元素添加了一个升序Key值，用来表示这个元素在数组中所处的位置，并且绑定到dom的dataset属性上，从而方便获取并更新positions数组
+   
+   ```js
+   watch(curList, () => {
+     let itemList = document.getElementsByClassName("list-item");
+     for (let i = 0; i < itemList.length; i++) {
+       //根据dataSet获取该元素对应的下标值
+       let index = Number(itemList[i].dataset.index);
+       //根据dom获取该元素的高度
+       let domHeight = itemList[i].offsetHeight;
+         
+       //从列表高度信息数组取出数据对比
+       let oldHeight = modelRef.value.positions[index].height;
+       let dValue = oldHeight - domHeight;
+   
+       //如果高度不一致更新列表高度信息
+       if (dValue != 0) {
+         //元素bottom = oldbottom - 差值
+         modelRef.value.positions[index].bottom =
+           modelRef.value.positions[index].bottom - dValue;
+         //元素高度 = dom元素实际高度
+         modelRef.value.positions[index].height = domHeight;
+   
+         //遍历后面的所有元素，修改元素的top和bottom值
+         for (let k = index + 1; k < modelRef.value.positions.length; k++) {
+           modelRef.value.positions[k].top =
+             modelRef.value.positions[k - 1].bottom;
+           modelRef.value.positions[k].bottom =
+             modelRef.value.positions[k].bottom - dValue;
+         }
+       }
+     }
+   });
+   ```
+   
+   实际上就是不断地修正`positions`数组，从而实现非等高虚拟滚动。但是这里也出现了双重for循环带来的高时间复杂度，因此实际非等高虚拟滚动应该配合懒加载去实现，减小`positions`数组的长度
+
+
+
+3. 面向未来
+
+   由于scroll事件触发太频繁，所以会带来极大的性能损耗，因此可以使用`IntersectionObserver`来代替scroll事件，`IntersectionObserver`可以监听目标元素是否出现在可视区域内，在监听的回调事件中执行可视区域数据的更新，并且`IntersectionObserver`的监听回调是异步触发，不随着目标元素的滚动而触发，性能消耗极低。
+
+
+
+4. 遗留问题
+
+   我们虽然实现了根据列表项动态高度下的虚拟列表，但如果列表项中包含图片，并且列表高度由图片撑开，由于图片会发送网络请求，此时无法保证我们在获取列表项真实高度时图片是否已经加载完成，从而造成计算不准确的情况。
+
+   这种情况下，如果我们能监听列表项的大小变化就能获取其真正的高度了。我们可以使用[ResizeObserver](https://link.juejin.cn?target=https%3A%2F%2Fdeveloper.mozilla.org%2Fzh-CN%2Fdocs%2FWeb%2FAPI%2FResizeObserver)来监听列表项内容区域的高度改变，从而实时获取每一列表项的高度。
